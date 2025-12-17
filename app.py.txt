@@ -1,0 +1,336 @@
+# app.py - Fully Fixed & Stable
+import os
+import gradio as gr
+from pathlib import Path
+import shutil
+import zipfile
+import subprocess
+import re
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# === LLM Setup ===
+try:
+    import ollama
+    OLLAMA_AVAILABLE = True
+except:
+    OLLAMA_AVAILABLE = False
+
+try:
+    from groq import Groq
+    GROQ_AVAILABLE = bool(os.getenv("GROQ_API_KEY"))
+except:
+    GROQ_AVAILABLE = False
+
+try:
+    import google.generativeai as genai
+    if os.getenv("GEMINI_API_KEY"):
+        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+        GEMINI_AVAILABLE = True
+    else:
+        GEMINI_AVAILABLE = False
+except:
+    GEMINI_AVAILABLE = False
+
+# === Board Configuration ===
+BOARD_OPTIONS = [
+    ("ESP32 DevKit", "esp32dev"),
+    ("ESP32-CAM", "esp32cam"),
+    ("ESP8266 NodeMCU", "nodemcuv2"),
+    ("Arduino Uno R4 WiFi", "uno_r4_wifi"),
+    ("Arduino Nano 33 IoT", "nano_33_iot"),
+    ("Arduino Uno (classic)", "uno"),
+    ("Arduino Nano (ATmega328)", "nanoatmega328"),
+    ("Arduino Mega 2560", "megaatmega2560"),
+    ("Raspberry Pi Pico W", "pico2"),
+]
+
+WIFI_BOARDS = {"esp32dev", "esp32cam", "nodemcuv2", "uno_r4_wifi", "nano_33_iot", "pico2"}
+OTA_BOARDS = {"esp32dev", "esp32cam", "nodemcuv2", "uno_r4_wifi", "nano_33_iot"}
+
+PLATFORM_MAP = {
+    "esp32dev": "espressif32",
+    "esp32cam": "espressif32",
+    "nodemcuv2": "espressif8266",
+    "uno_r4_wifi": "renesas_uno",
+    "nano_33_iot": "atmelsam",
+    "pico2": "raspberrypi",
+    "uno": "atmelavr",
+    "nanoatmega328": "atmelavr",
+    "megaatmega2560": "atmelavr",
+}
+
+# === Paths ===
+BASE_DIR = Path(__file__).parent
+OUTPUT_DIR = BASE_DIR / "generated_projects"
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+# === LLM Calls ===
+def call_llm(provider: str, prompt: str) -> str:
+    try:
+        if provider == "ollama" and OLLAMA_AVAILABLE:
+            response = ollama.chat(model="codestral", messages=[{"role": "user", "content": prompt}])
+            return response["message"]["content"]
+        elif provider == "groq" and GROQ_AVAILABLE:
+            client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+            response = client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model="llama-3.3-70b-versatile",
+                temperature=0.1,
+                max_tokens=3000
+            )
+            return response.choices[0].message.content
+        elif provider == "gemini" and GEMINI_AVAILABLE:
+            model = genai.GenerativeModel("gemini-2.0-flash")
+            response = model.generate_content(prompt, safety_settings={"HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE"})
+            return response.text
+        return f"❌ {provider} not available"
+    except Exception as e:
+        return f"❌ LLM Error: {str(e)}"
+
+# === Prompt Enhancement ===
+def enhance_prompt(raw_input: str, provider: str) -> str:
+    if not raw_input.strip():
+        return "❌ Please enter a description first"
+    enhancement_prompt = f"""You are a technical writing assistant. Convert this user input into a clear, professional English prompt for embedded systems code generation.
+Rules:
+- Translate to English if needed
+- Fix grammar and spelling
+- Make it technical and specific
+- Keep it concise (max 3 sentences)
+- Focus on functionality, not implementation details
+User input: {raw_input}
+Output ONLY the improved prompt, nothing else."""
+    result = call_llm(provider, enhancement_prompt)
+    result = result.strip().replace('"', '').replace("'", "")
+    if result.startswith("Here") or result.startswith("Improved"):
+        lines = result.split("\n")
+        result = lines[-1] if lines else result
+    return result.strip()
+
+# === Project Generation ===
+def generate_project(mode: str, description: str, libraries: str, board_id: str, provider: str, ino_file, progress=gr.Progress()):
+    progress(0, desc="Initializing...")
+    
+    # === ВСЕГДА определяем ino_content ===
+    ino_content = ""
+    base_prompt = ""
+
+    if mode == "refactor" and ino_file:
+        progress(0.1, desc="Reading .ino file...")
+        with open(ino_file.name, "r", encoding="utf-8") as f:
+            ino_content = f.read()
+        base_prompt = f"""Convert this Arduino .ino sketch to modular C++ for PlatformIO.
+Board: {board_id}
+Create separate files: main.cpp, sensors.h/cpp, network.h/cpp
+Original code:
+{ino_content}
+"""
+    else:
+        if description.strip():
+            progress(0.05, desc="Enhancing prompt...")
+            enhanced_desc = enhance_prompt(description, provider)
+            if not enhanced_desc.startswith("❌"):
+                description = enhanced_desc
+        progress(0.1, desc="Preparing prompt...")
+        base_prompt = f"""Create modular C++ code for embedded project.
+Board: {board_id}
+Description: {description}
+Libraries: {libraries}
+Generate separate modules for sensors, networking, etc.
+"""
+
+    project_name = "embedded_project"
+    project_path = OUTPUT_DIR / project_name
+    if project_path.exists():
+        shutil.rmtree(project_path)
+    project_path.mkdir(parents=True)
+    src_dir = project_path / "src"
+    src_dir.mkdir(exist_ok=True)
+
+    modules = []
+    has_wifi = board_id in WIFI_BOARDS
+    if has_wifi:
+        modules.append("network")
+    modules.append("sensors")
+
+    lib_list = [lib.strip() for lib in libraries.split("\n") if lib.strip()]
+    if has_wifi and not lib_list:
+        if board_id in {"esp32dev", "esp32cam"}:
+            lib_list.extend(["WiFi", "ArduinoOTA"])
+        elif board_id == "nodemcuv2":
+            lib_list.extend(["ESP8266WiFi", "ArduinoOTA"])
+        elif board_id == "uno_r4_wifi":
+            lib_list.extend(["WiFiS3", "ArduinoOTA"])
+        elif board_id == "nano_33_iot":
+            lib_list.extend(["WiFiNINA", "ArduinoOTA"])
+        elif board_id == "pico2":
+            lib_list.append("WiFi")
+
+    progress(0.2, desc="Generating main.cpp...")
+    main_prompt = f"""{base_prompt}
+Write ONLY main.cpp with setup() and loop() functions.
+Include necessary headers. Format as raw C++ code.
+"""
+    main_code = call_llm(provider, main_prompt)
+    if "#include" in main_code or "void setup" in main_code:
+        (src_dir / "main.cpp").write_text(main_code, encoding="utf-8")
+    else:
+        (src_dir / "main.cpp").write_text(
+            "#include <Arduino.h>\nvoid setup() {\n  Serial.begin(115200);\n}\nvoid loop() {\n  delay(1000);\n}\n",
+            encoding="utf-8"
+        )
+
+    for i, module in enumerate(modules):
+        progress(0.3 + i * 0.3, desc=f"Generating {module}...")
+        module_prompt = f"""{base_prompt}
+STRICT INSTRUCTIONS:
+- Output ONLY these two sections.
+- NO explanations, NO markdown.
+- Use EXACTLY:
+--- {module}.h ---
+[header]
+--- {module}.cpp ---
+[implementation]
+"""
+        module_code = call_llm(provider, module_prompt)
+
+        h_pattern = rf"---\s*{module}\.h\s*---\s*(.*?)(?=---|$)"
+        h_match = re.search(h_pattern, module_code, re.DOTALL | re.IGNORECASE)
+        if h_match:
+            (src_dir / f"{module}.h").write_text(h_match.group(1).strip(), encoding="utf-8")
+
+        cpp_pattern = rf"---\s*{module}\.cpp\s*---\s*(.*?)$"
+        cpp_match = re.search(cpp_pattern, module_code, re.DOTALL | re.IGNORECASE)
+        if cpp_match:
+            (src_dir / f"{module}.cpp").write_text(cpp_match.group(1).strip(), encoding="utf-8")
+
+    progress(0.8, desc="Creating platformio.ini...")
+    platform = PLATFORM_MAP.get(board_id, "espressif32")
+    if lib_list:
+        lib_deps_lines = "\n".join(f"    {lib}" for lib in lib_list)
+        lib_section = f"lib_deps =\n{lib_deps_lines}"
+    else:
+        lib_section = "; lib_deps = (auto-detected or empty)"
+    ini_content = f"""[env:{board_id}]
+platform = {platform}
+board = {board_id}
+framework = arduino
+{lib_section}
+monitor_speed = 115200
+"""
+    (project_path / "platformio.ini").write_text(ini_content, encoding="utf-8")
+
+    progress(0.9, desc="Creating README...")
+    # === БЕЗОПАСНАЯ СБОРКА README без тройных f-строк ===
+    readme_lines = [
+        f"# {project_name.title()}",
+        "",
+        "## Hardware",
+        f"- Board: {board_id}",
+        f"- Platform: {platform}",
+        "",
+        "## Description",
+        description if mode == "description" else "Refactored from .ino sketch",
+        "",
+        "## Libraries"
+    ]
+    if lib_list:
+        for lib in lib_list:
+            readme_lines.append(f"- {lib}")
+    else:
+        readme_lines.append("*Auto-detected from code*")
+    
+    readme_lines.extend([
+        "",
+        "## Build",
+        "```bash",
+        "pio run",
+        "```",
+        "",
+        "## Upload",
+        "```bash",
+        "pio run --target upload",
+        "```",
+        "",
+        "## License",
+        "MIT"
+    ])
+    readme = "\n".join(readme_lines)
+    (project_path / "README.md").write_text(readme, encoding="utf-8")
+
+    progress(0.95, desc="Creating ZIP...")
+    zip_path = OUTPUT_DIR / f"{project_name}.zip"
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for file in project_path.rglob('*'):
+            if file.is_file():
+                zf.write(file, file.relative_to(OUTPUT_DIR))
+
+    progress(1.0, desc="✅ Complete!")
+    actual_files = ["main.cpp"]
+    for m in modules:
+        h_ok = (src_dir / f"{m}.h").exists()
+        cpp_ok = (src_dir / f"{m}.cpp").exists()
+        if h_ok and cpp_ok:
+            actual_files.append(f"{m}.h/{m}.cpp")
+        else:
+            actual_files.append(f"{m}.h/{m}.cpp ❌ MISSING")
+    file_list = "\n- ".join(actual_files)
+    return str(zip_path), f"✅ Project generation complete!\n\nFiles created:\n- {file_list}\n- platformio.ini\n- README.md"
+
+# === Compile Function ===
+def compile_project():
+    project_path = OUTPUT_DIR / "embedded_project"
+    if not project_path.exists():
+        return "❌ No project generated yet. Click 'Generate' first."
+    try:
+        result = subprocess.run(["pio", "run", "-d", str(project_path)], capture_output=True, text=True, timeout=120)
+        output = result.stdout + result.stderr
+        if result.returncode == 0:
+            return f"✅ Compilation successful!\n{output}"
+        else:
+            return f"❌ Compilation failed:\n{output}"
+    except FileNotFoundError:
+        return "❌ PlatformIO not found.\nRun: pip install -U platformio"
+    except Exception as e:
+        return f"❌ Error: {str(e)}"
+
+# === UI ===
+with gr.Blocks(title="ESP32 Code Generator") as demo:
+    gr.Markdown("# 🔧 Embedded Project Generator")
+    mode = gr.Radio(choices=[("📝 From Description", "description"), ("📄 Refactor .ino", "refactor")], value="description", label="Generation Mode")
+
+    with gr.Group(visible=True) as desc_inputs:
+        description = gr.Textbox(label="Project Description", lines=3)
+        libraries = gr.Textbox(label="Libraries (optional)", lines=4, value="")
+
+    with gr.Group(visible=False) as ino_inputs:
+        ino_file = gr.File(label="Upload .ino File", file_types=[".ino"])
+
+    def toggle_inputs(mode_val):
+        return (
+            gr.update(visible=(mode_val == "description")),
+            gr.update(visible=(mode_val == "refactor"))
+        )
+
+    mode.change(toggle_inputs, [mode], [desc_inputs, ino_inputs])
+
+    board = gr.Dropdown(BOARD_OPTIONS, value="esp32dev", label="Target Board")
+    provider_choices = [("🏠 Ollama (Local)", "ollama")]
+    if GROQ_AVAILABLE: provider_choices.append(("☁️ Groq (Cloud)", "groq"))
+    if GEMINI_AVAILABLE: provider_choices.append(("🤖 Gemini (Google)", "gemini"))
+    provider = gr.Radio(provider_choices, value="ollama", label="AI Backend")
+
+    with gr.Row():
+        btn_generate = gr.Button("🚀 Generate Project", variant="primary")
+        btn_compile = gr.Button("⚙️ Compile")
+
+    output_zip = gr.File(label="📦 Download Project")
+    output_log = gr.Textbox(label="Output Log", lines=10)
+
+    btn_generate.click(generate_project, inputs=[mode, description, libraries, board, provider, ino_file], outputs=[output_zip, output_log])
+    btn_compile.click(compile_project, outputs=[output_log])
+
+if __name__ == "__main__":
+    demo.launch(server_name="127.0.0.1", server_port=7860)
